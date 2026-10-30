@@ -11,6 +11,8 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 
 ![構成図](docs/architecture.png)
 
+![利用状況ダッシュボード](docs/dashboard.png)
+
 設計と検証の経緯は Zenn の記事「Lambda+Bedrockで作る簡易LLMプロキシ(認証・制限・ログ)」にまとめています。
 
 ## 構成
@@ -80,9 +82,9 @@ terraform apply -var 'allowed_betas=context-management-2025-06-27,interleaved-th
 - キー別・モデル別トークン数(入力 / 出力)
 - 拒否・エラーの理由
 - リクエスト数の推移(5 分ごと、判定別)
-- レイテンシ(p50 / p95 / max)
+- レイテンシ(平均 / p95 / 最大、5 分ごとの棒グラフ)
 - Lambda の Invocations / Errors / Throttles
-- 渡されたツール名の組み合わせ
+- 渡されたツール名(`tools.0`〜`tools.4`、先頭 5 個の組み合わせ)
 
 アカウント内のカスタムダッシュボードは 3 枚まで無料、4 枚目以降は 1 枚 $3/月。ウィジェットの描画時に Logs Insights のスキャン課金がかかる(東京: $0.0076/GB)。
 

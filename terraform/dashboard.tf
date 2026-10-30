@@ -20,7 +20,7 @@ locals {
       type = "log", x = 12, y = 2, width = 12, height = 8,
       properties = {
         title = "キー別トークン数(入力 / 出力)", region = var.region, view = "table",
-        query = "SOURCE '${local.lg}' | ${local.q_base} | filter decision = 'allow' | stats sum(inputTokens) as inTokens, sum(outputTokens) as outTokens, count() as requests by keyName, model | sort inTokens desc"
+        query = "SOURCE '${local.lg}' | ${local.q_base} | filter decision = 'allow' and ispresent(model) | stats sum(inputTokens) as inTokens, sum(outputTokens) as outTokens, count() as requests by keyName, model | sort inTokens desc"
       }
     },
     {
@@ -40,8 +40,8 @@ locals {
     {
       type = "log", x = 0, y = 18, width = 12, height = 8,
       properties = {
-        title = "レイテンシ(ms、allow のみ)", region = var.region, view = "line",
-        query = "SOURCE '${local.lg}' | ${local.q_base} | filter decision = 'allow' | stats pct(latencyMs, 50) as p50, pct(latencyMs, 95) as p95, max(latencyMs) as max by bin(5m)"
+        title = "レイテンシ(ms、allow のみ。平均 / p95 / 最大)", region = var.region, view = "bar",
+        query = "SOURCE '${local.lg}' | ${local.q_base} | filter decision = 'allow' | stats avg(latencyMs) as avgMs, pct(latencyMs, 95) as p95Ms, max(latencyMs) as maxMs by bin(5m)"
       }
     },
     {
@@ -58,8 +58,8 @@ locals {
     {
       type = "log", x = 0, y = 26, width = 24, height = 8,
       properties = {
-        title = "ツール名の出現回数(どのツールが渡されているか)", region = var.region, view = "table",
-        query = "SOURCE '${local.lg}' | filter ispresent(decision) | parse @message '\"tools\":[*]' as toolList | filter ispresent(toolList) and toolList != '' | stats count() as requests by toolList | sort requests desc | limit 20"
+        title = "渡されたツール名(先頭 5 個の組み合わせ)", region = var.region, view = "table",
+        query = "SOURCE '${local.lg}' | fields @timestamp, keyName, tools.0, tools.1, tools.2, tools.3, tools.4 | filter ispresent(decision) and ispresent(tools.0) | stats count() as requests by keyName, tools.0, tools.1, tools.2, tools.3, tools.4 | sort requests desc | limit 20"
       }
     },
   ]
