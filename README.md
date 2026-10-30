@@ -4,9 +4,10 @@ AWS Lambda の Function URL で Anthropic Messages API 互換と OpenAI 互換(C
 Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anthropic SDK、OpenAI SDK、Codex CLI から接続先の差し替えだけで使えます。
 
 - コードは 2 ファイル(約 570 行)、依存パッケージなし(AWS SDK v3 は Lambda ランタイム同梱)
-- インフラは CloudFormation テンプレート 1 枚。固定費ゼロ
+- インフラは Terraform(Lambda、Function URL、IAM、ログ、ダッシュボード)。固定費ゼロ
 - API キーごとに、使えるモデル(エイリアス → Bedrock モデル ID)、ツール名の allow / deny、送信元 CIDR を制限
 - 1 リクエスト 1 行の JSON ログを CloudWatch Logs に出力(キー名、モデル、ツール名、トークン数、判定理由)
+- 利用状況の可視化: CloudWatch ダッシュボード(Terraform で作成)と、Markdown の利用レポートを出す `usage-report.py`
 
 ![構成図](docs/architecture.png)
 
@@ -18,8 +19,8 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 | --- | --- |
 | `src/index.mjs` | ルーティング・認証・制限・ログ・Bedrock 転送 |
 | `src/openai.mjs` | OpenAI 形式(Chat Completions / Responses API)と Anthropic Messages 形式の相互変換。LiteLLM の変換を参考にした |
-| `template.yaml` | CloudFormation(LogGroup、IAM ロール、Lambda、Function URL、Permission×2) |
-| `deploy.sh` | `aws cloudformation package` + `deploy`。アーティファクト用 S3 バケットがなければ作る |
+| `terraform/` | Lambda、Function URL、IAM、CloudWatch Logs、利用状況ダッシュボードの定義 |
+| `usage-report.py` | Logs Insights からキー別・モデル別の利用状況と拒否理由を集計して Markdown 出力 |
 | `keys.example.json` | API キー設定の例。コピーして `keys.json` にする(git 管理外) |
 | `cost-estimate.py` | 月額ランニングコストの試算スクリプト(単価と前提はファイル内に記載) |
 | `docs/` | 構成図・シーケンス図(PNG と Mermaid ソース) |
@@ -35,28 +36,78 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 
 認証は `x-api-key` または `Authorization: Bearer <key>`。ツール制限はどの形式でも「モデルに渡すツール定義の名前」で判定します。
 
-## デプロイ
+## デプロイ(Terraform)
+
+API キー設定は Terraform の state に入れたくないので、SSM パラメータだけ AWS CLI で登録します。
 
 ```bash
-export AWS_REGION=ap-northeast-1
 cp keys.example.json keys.json   # キー・モデル・ツール・CIDR を編集
-aws ssm put-parameter --name /llm-proxy/keys --type SecureString --value file://keys.json --overwrite
-./deploy.sh llm-proxy
+aws ssm put-parameter --name /llm-proxy/keys --type SecureString --value file://keys.json --overwrite --region ap-northeast-1
+
+cd terraform
+terraform init
+terraform apply
+# Outputs: function_url, log_group_name, dashboard_url
 ```
 
 Claude Code から使う場合は、Bedrock が受け付ける beta だけを許可リストに入れます(それ以外の `anthropic-beta` は落としてログに記録)。
 
 ```bash
-./deploy.sh llm-proxy --parameter-overrides AllowedBetas="context-management-2025-06-27,interleaved-thinking-2025-05-14"
+terraform apply -var 'allowed_betas=context-management-2025-06-27,interleaved-thinking-2025-05-14'
 ```
 
-### パラメータ
+`authorization_type = "NONE"` の Function URL を Terraform で作ると、`lambda:InvokeFunctionUrl` と `lambda:InvokeFunction`(`InvokedViaFunctionUrl`)の 2 つの許可がプロバイダによって自動で付きます。
+
+### 変数
 
 | 名前 | 既定値 | 内容 |
 | --- | --- | --- |
-| `KeysParameterName` | `/llm-proxy/keys` | API キー設定を置く SSM パラメータ名 |
-| `LogRetentionDays` | `30` | CloudWatch Logs の保持日数 |
-| `AllowedBetas` | 空 | クライアントの `anthropic-beta` のうち Bedrock へ渡す値(カンマ区切り) |
+| `region` | `ap-northeast-1` | デプロイ先リージョン |
+| `name` | `llm-proxy` | 関数名(ロググループ・ダッシュボード名にも使う) |
+| `keys_parameter_name` | `/llm-proxy/keys` | API キー設定を置く SSM パラメータ名 |
+| `allowed_betas` | 空 | クライアントの `anthropic-beta` のうち Bedrock へ渡す値(カンマ区切り) |
+| `log_retention_days` | `30` | CloudWatch Logs の保持日数 |
+| `memory_size` / `timeout` | `256` / `300` | Lambda のメモリ(MB)とタイムアウト(秒) |
+| `create_dashboard` | `true` | 利用状況ダッシュボードを作るか |
+
+## 可視化
+
+### CloudWatch ダッシュボード(`<name>-usage`)
+
+ログが 1 リクエスト 1 行の JSON なので、Logs Insights のクエリをそのままウィジェットにしています。
+
+- キー別リクエスト数(allow / deny / error)
+- キー別・モデル別トークン数(入力 / 出力)
+- 拒否・エラーの理由
+- リクエスト数の推移(5 分ごと、判定別)
+- レイテンシ(p50 / p95 / max)
+- Lambda の Invocations / Errors / Throttles
+- 渡されたツール名の組み合わせ
+
+アカウント内のカスタムダッシュボードは 3 枚まで無料、4 枚目以降は 1 枚 $3/月。ウィジェットの描画時に Logs Insights のスキャン課金がかかる(東京: $0.0076/GB)。
+
+### 利用レポート(`usage-report.py`)
+
+Slack や月次報告に貼る用途向けに、同じ集計を Markdown で出します。AWS CLI の認証情報を使い、boto3 は不要です。
+
+```bash
+python3 usage-report.py --hours 24 --region ap-northeast-1 [--profile NAME]
+```
+
+```markdown
+## キー別(判定ごと)
+
+| keyName | decision | requests | inTokens | outTokens |
+| --- | --- | --- | --- | --- |
+| team-a | allow | 5 | 62 | 31 |
+| team-a | deny | 2 |  |  |
+...
+## 合計
+
+- 許可リクエスト: 5
+- 入力トークン: 62 / 出力トークン: 31
+- 概算 Bedrock 費用(単価 入力 $1.1 / 出力 $5.5 per 1M tokens として): $0.0002
+```
 
 ## キー設定(`keys.json`)
 
@@ -113,8 +164,8 @@ wire_api = "responses"
 ## 削除
 
 ```bash
-aws cloudformation delete-stack --stack-name llm-proxy
-aws ssm delete-parameter --name /llm-proxy/keys
+cd terraform && terraform destroy
+aws ssm delete-parameter --name /llm-proxy/keys --region ap-northeast-1
 ```
 
 ## ライセンス
