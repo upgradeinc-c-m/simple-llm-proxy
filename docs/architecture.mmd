@@ -1,0 +1,28 @@
+flowchart TB
+    subgraph Clients["クライアント(接続先URLとキーを差し替えるだけ)"]
+        direction LR
+        CC["Claude Code<br/>ANTHROPIC_BASE_URL"]
+        AS["Anthropic SDK<br/>baseURL"]
+        OS["OpenAI SDK<br/>baseURL + /v1"]
+        CX["Codex CLI<br/>wire_api = responses"]
+    end
+    URL["Lambda Function URL<br/>AuthType NONE / InvokeMode RESPONSE_STREAM"]
+    subgraph L["Lambda(Node.js 22、依存パッケージなし、2ファイル)"]
+        direction LR
+        R["ルーティング<br/>/v1/messages<br/>/v1/chat/completions<br/>/v1/responses<br/>/v1/models"]
+        A["認証・制限<br/>APIキー / 送信元CIDR<br/>モデル許可リスト / ツール名"]
+        T["形式変換<br/>OpenAI形式 → Anthropic形式"]
+        F["転送<br/>InvokeModel /<br/>InvokeModelWithResponseStream"]
+        R --> A --> T --> F
+    end
+    SSM["SSM Parameter Store<br/>/llm-proxy/keys(SecureString)<br/>60秒キャッシュ"]
+    CW["CloudWatch Logs<br/>1リクエスト1行のJSON<br/>decision / tools / tokens"]
+    BR["Amazon Bedrock<br/>jp.anthropic.claude-haiku-4-5 など"]
+    CC -->|"Anthropic Messages"| URL
+    AS -->|"Anthropic Messages"| URL
+    OS -->|"Chat Completions"| URL
+    CX -->|"Responses API"| URL
+    URL --> L
+    A -.-> SSM
+    F --> BR
+    L -.-> CW

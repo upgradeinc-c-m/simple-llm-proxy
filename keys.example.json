@@ -1,0 +1,16 @@
+{
+  "proxy-key-team-a-change-me": {
+    "name": "team-a",
+    "models": {
+      "claude-haiku-4-5": "jp.anthropic.claude-haiku-4-5-20251001-v1:0",
+      "claude-sonnet-4-5": "jp.anthropic.claude-sonnet-4-5-20250929-v1:0"
+    },
+    "tools": { "deny": ["bash", "computer", "str_replace_based_edit_tool"] },
+    "cidrs": ["203.0.113.0/24"]
+  },
+  "proxy-key-ci-change-me": {
+    "name": "ci",
+    "models": { "claude-haiku-4-5": "jp.anthropic.claude-haiku-4-5-20251001-v1:0" },
+    "tools": { "allow": [] }
+  }
+}
