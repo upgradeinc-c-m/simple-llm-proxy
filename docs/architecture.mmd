@@ -8,7 +8,7 @@ flowchart TB
         CX["Codex CLI<br/>wire_api = responses"]
     end
     URL["Lambda Function URL<br/>AuthType NONE / InvokeMode RESPONSE_STREAM"]
-    subgraph L["Lambda(Node.js 22、依存パッケージなし、3ファイル)"]
+    subgraph L["プロキシ本体 Lambda(Node.js 22、依存パッケージなし、3ファイル)"]
         direction LR
         R["ルーティング<br/>/v1/messages<br/>/v1/chat/completions<br/>/v1/responses<br/>/v1/models"]
         A["認証・制限<br/>APIキー / 送信元CIDR / モデル / ツール名<br/>予算・RPM・TPM・有効期限"]
