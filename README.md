@@ -3,7 +3,7 @@
 AWS Lambda の Function URL で Anthropic Messages API 互換と OpenAI 互換(Chat Completions / Responses API)のリクエストを受け、
 Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anthropic SDK、OpenAI SDK、Codex CLI から接続先の差し替えだけで使えます。
 
-- コードは 2 ファイル(約 570 行)、依存パッケージなし(AWS SDK v3 は Lambda ランタイム同梱)
+- コードはプロキシ本体 3 ファイル + 管理 UI 2 ファイル(計約 950 行)、依存パッケージなし(AWS SDK v3 は Lambda ランタイム同梱)
 - インフラは Terraform(Lambda、Function URL、IAM、ログ、ダッシュボード)。固定費ゼロ
 - API キーは `keyctl.py` で発行・失効(保存は SHA-256 ハッシュ。平文は発行時に 1 回だけ表示)
 - キーごとに、使えるモデル(エイリアス → Bedrock モデル ID)、ツール名の allow / deny、送信元 CIDR、有効期限を制限
@@ -19,7 +19,7 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 
 ![管理 UI](docs/admin-ui.png)
 
-設計と検証の経緯は Zenn の記事「Lambda+Bedrockで作る簡易LLMプロキシ(認証・制限・ログ)」にまとめています。
+設計と検証の経緯は Zenn の記事「LambdaとBedrockで自作するLLMプロキシ(キー発行・予算・管理UI)」にまとめています。
 
 ## 構成
 
