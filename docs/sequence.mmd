@@ -2,14 +2,14 @@ sequenceDiagram
     autonumber
     participant C as クライアント
     participant P as プロキシ (Lambda)
-    participant S as SSM Parameter Store
+    participant S as DynamoDB(キー / 利用量)
     participant B as Amazon Bedrock
     participant L as CloudWatch Logs
     C->>P: POST /v1/messages など<br/>x-api-key, model, tools[], stream
-    P->>S: GetParameter(キー設定)<br/>60秒キャッシュ
-    S-->>P: {models, tools, cidrs}
-    alt キー不正 / CIDR外 / モデル不許可 / ツール拒否
-        P-->>C: 401 / 403 (理由つき)
+    P->>S: キー設定(SHA-256で照合、60秒キャッシュ)<br/>+ 当該分・当該期間の利用量
+    S-->>P: {models, tools, cidrs, limits} / {requests, tokens, cost}
+    alt キー不正 / 期限切れ / 無効 / CIDR外 / モデル不許可 / ツール拒否 / RPM・TPM・予算超過
+        P-->>C: 401 / 403 / 429 (理由つき)
         P->>L: decision: deny, reason
     else 許可
         P->>B: InvokeModelWithResponseStream<br/>(Anthropic形式のボディ)
@@ -17,5 +17,6 @@ sequenceDiagram
             B-->>P: chunk (message_start, content_block_delta, ...)
             P-->>C: SSE (入口の形式に変換)
         end
-        P->>L: decision: allow, keyName, model, tools,<br/>inputTokens, outputTokens, latencyMs
+        P->>S: 利用量を加算(分・日・月)<br/>requests, tokens, costMicroUsd
+        P->>L: decision: allow, keyName, keyId, model, tools,<br/>inputTokens, outputTokens, costUsd, latencyMs
     end

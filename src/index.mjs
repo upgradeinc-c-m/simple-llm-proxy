@@ -5,29 +5,17 @@ import {
   InvokeModelCommand,
   InvokeModelWithResponseStreamCommand,
 } from "@aws-sdk/client-bedrock-runtime";
-import { SSMClient, GetParameterCommand } from "@aws-sdk/client-ssm";
+import { loadKeyMeta, loadPrices, checkLimits, estimateCost, recordUsage } from "./keys.mjs";
 import {
   BadRequest, chatToAnthropic, anthropicToChat, chatStream,
   responsesToAnthropic, anthropicToResponses, responsesStream, modelList,
 } from "./openai.mjs";
 
-const KEYS_PARAM = process.env.KEYS_PARAM ?? "/llm-proxy/keys";
-const KEYS_TTL_MS = Number(process.env.KEYS_TTL_MS ?? 60_000);
 const ANTHROPIC_VERSION = "bedrock-2023-05-31";
 // クライアントが送る anthropic-beta のうち Bedrock に渡してよいもの。未知の値を渡すと Bedrock が 400 を返す。
 const ALLOWED_BETAS = (process.env.ALLOWED_BETAS ?? "").split(",").map((s) => s.trim()).filter(Boolean);
 
 const bedrock = new BedrockRuntimeClient({});
-const ssm = new SSMClient({});
-let keysCache = { value: null, loadedAt: 0 };
-
-// --- 設定の読み込み(SSM SecureString、60 秒キャッシュ) ---------------------------
-async function loadKeys() {
-  if (keysCache.value && Date.now() - keysCache.loadedAt < KEYS_TTL_MS) return keysCache.value;
-  const res = await ssm.send(new GetParameterCommand({ Name: KEYS_PARAM, WithDecryption: true }));
-  keysCache = { value: JSON.parse(res.Parameter.Value), loadedAt: Date.now() };
-  return keysCache.value;
-}
 
 // --- 送信元 IP の CIDR 判定(IPv4 のみ。IPv6 は完全一致) -------------------------
 function ipToInt(ip) {
@@ -85,7 +73,7 @@ const ADAPTERS = {
     stream: (alias) => ({
       usage: {},
       onEvent(json) {
-        if (json.type === "message_start") { this.usage.input_tokens = json.message?.usage?.input_tokens; json.message.model = alias; }
+        if (json.type === "message_start") { Object.assign(this.usage, json.message?.usage ?? {}); json.message.model = alias; }
         if (json.type === "message_delta") this.usage.output_tokens = json.usage?.output_tokens;
         return `event: ${json.type}\ndata: ${JSON.stringify(json)}\n\n`;
       },
@@ -159,15 +147,15 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream,
     return sendError(404, "not_found_error", `unsupported route: ${route}. supported: ${Object.keys(ROUTES).join(", ")}, GET /v1/models`);
   }
 
-  // 認証: x-api-key か Authorization: Bearer
+  // 認証: x-api-key か Authorization: Bearer。キーは SHA-256 ハッシュで DynamoDB を引く(60 秒キャッシュ)
   const apiKey = headers["x-api-key"] ?? headers["authorization"]?.replace(/^Bearer\s+/i, "");
-  const keys = await loadKeys();
-  const keyConfig = apiKey ? keys[apiKey] : undefined;
+  const { keyHash, meta: keyConfig } = apiKey ? await loadKeyMeta(apiKey) : { keyHash: null, meta: null };
   if (!keyConfig) {
     finish(401, { decision: "deny", reason: "invalid_api_key" });
     return sendError(401, "authentication_error", "invalid api key");
   }
   log.keyName = keyConfig.name ?? "unnamed";
+  log.keyId = keyConfig.keyId;
 
   if (format === "models") {
     finish(200, { decision: "allow" });
@@ -199,7 +187,23 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream,
   const modelId = keyConfig.models[alias];
   log.modelId = modelId;
 
+  // 利用量制限(無効化・有効期限・RPM・TPM・予算)。超過は Bedrock を呼ぶ前に返す
+  const limited = await checkLimits(keyHash, keyConfig);
+  if (limited) {
+    finish(limited.status, { decision: "deny", reason: limited.message });
+    return sendError(limited.status, limited.type, limited.message);
+  }
+
   const usage = {};
+  const settle = async (status) => {
+    // 利用量と費用を記録してからログを出す(ストリーミングでも応答完了後に 1 回)
+    const prices = await loadPrices();
+    const { costUsd, unpriced } = estimateCost(prices, modelId, usage);
+    log.costUsd = Number(costUsd.toFixed(6));
+    if (unpriced) log.unpriced = true;
+    try { await recordUsage(keyHash, usage, costUsd); } catch (e) { log.usageRecordError = e.name; }
+    finish(status, { decision: "allow", ...usage });
+  };
   try {
     if (!wantStream) {
       const res = await bedrock.send(new InvokeModelCommand({
@@ -207,9 +211,12 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream,
         body: JSON.stringify(anthropicBody),
       }));
       const json = JSON.parse(Buffer.from(res.body).toString());
-      Object.assign(usage, { inputTokens: json.usage?.input_tokens, outputTokens: json.usage?.output_tokens, stopReason: json.stop_reason });
-      finish(200, { decision: "allow", ...usage });
-      return sendJson(responseStream, 200, adapter.fromAnthropic(json, alias, req));
+      Object.assign(usage, {
+        inputTokens: json.usage?.input_tokens, outputTokens: json.usage?.output_tokens, stopReason: json.stop_reason,
+        cacheReadTokens: json.usage?.cache_read_input_tokens, cacheWriteTokens: json.usage?.cache_creation_input_tokens,
+      });
+      sendJson(responseStream, 200, adapter.fromAnthropic(json, alias, req));
+      return settle(200);
     }
 
     // ストリーミング: Bedrock のイベントストリームを入口の形式の SSE に変換して流す
@@ -232,7 +239,9 @@ export const handler = awslambda.streamifyResponse(async (event, responseStream,
     out.end();
     usage.inputTokens = conv.usage.input_tokens;
     usage.outputTokens = conv.usage.output_tokens;
-    finish(200, { decision: "allow", ...usage });
+    usage.cacheReadTokens = conv.usage.cache_read_input_tokens;
+    usage.cacheWriteTokens = conv.usage.cache_creation_input_tokens;
+    await settle(200);
   } catch (err) {
     const mapped = mapBedrockError(err);
     finish(mapped.status, { decision: "error", reason: mapped.message, ...usage });

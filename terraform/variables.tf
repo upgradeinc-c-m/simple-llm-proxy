@@ -10,10 +10,10 @@ variable "name" {
   default     = "llm-proxy"
 }
 
-variable "keys_parameter_name" {
-  description = "API キー設定(JSON)を置く SSM SecureString パラメータ名。パラメータ自体は Terraform 管理外(aws ssm put-parameter で登録)"
+variable "keys_table_name" {
+  description = "API キーと利用量を保存する DynamoDB テーブル名(Terraform が作成。キーの発行は keyctl.py)"
   type        = string
-  default     = "/llm-proxy/keys"
+  default     = "llm-proxy-keys"
 }
 
 variable "allowed_betas" {

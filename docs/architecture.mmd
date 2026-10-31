@@ -1,4 +1,5 @@
 flowchart TB
+    KC["keyctl.py(管理者、IAM権限)<br/>キー発行 / 失効 / 制限変更 / 利用量"]
     subgraph Clients["クライアント(接続先URLとキーを差し替えるだけ)"]
         direction LR
         CC["Claude Code<br/>ANTHROPIC_BASE_URL"]
@@ -7,22 +8,24 @@ flowchart TB
         CX["Codex CLI<br/>wire_api = responses"]
     end
     URL["Lambda Function URL<br/>AuthType NONE / InvokeMode RESPONSE_STREAM"]
-    subgraph L["Lambda(Node.js 22、依存パッケージなし、2ファイル)"]
+    subgraph L["Lambda(Node.js 22、依存パッケージなし、3ファイル)"]
         direction LR
         R["ルーティング<br/>/v1/messages<br/>/v1/chat/completions<br/>/v1/responses<br/>/v1/models"]
-        A["認証・制限<br/>APIキー / 送信元CIDR<br/>モデル許可リスト / ツール名"]
+        A["認証・制限<br/>APIキー / 送信元CIDR / モデル / ツール名<br/>予算・RPM・TPM・有効期限"]
         T["形式変換<br/>OpenAI形式 → Anthropic形式"]
         F["転送<br/>InvokeModel /<br/>InvokeModelWithResponseStream"]
         R --> A --> T --> F
     end
-    SSM["SSM Parameter Store<br/>/llm-proxy/keys(SecureString)<br/>60秒キャッシュ"]
-    CW["CloudWatch Logs<br/>1リクエスト1行のJSON<br/>decision / tools / tokens"]
+    DDB["DynamoDB(1テーブル)<br/>キー設定(SHA-256ハッシュ)<br/>期間別の利用量・費用 / モデル単価"]
+    CW["CloudWatch Logs + ダッシュボード<br/>1リクエスト1行のJSON<br/>decision / tools / tokens / costUsd"]
     BR["Amazon Bedrock<br/>jp.anthropic.claude-haiku-4-5 など"]
     CC -->|"Anthropic Messages"| URL
     AS -->|"Anthropic Messages"| URL
     OS -->|"Chat Completions"| URL
     CX -->|"Responses API"| URL
     URL --> L
-    A -.-> SSM
+    KC -.-> DDB
+    A <-.->|"照合・利用量チェック(60秒キャッシュ)"| DDB
+    F -.->|"トークン数・費用を加算"| DDB
     F --> BR
     L -.-> CW

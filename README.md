@@ -5,7 +5,10 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 
 - コードは 2 ファイル(約 570 行)、依存パッケージなし(AWS SDK v3 は Lambda ランタイム同梱)
 - インフラは Terraform(Lambda、Function URL、IAM、ログ、ダッシュボード)。固定費ゼロ
-- API キーごとに、使えるモデル(エイリアス → Bedrock モデル ID)、ツール名の allow / deny、送信元 CIDR を制限
+- API キーは `keyctl.py` で発行・失効(保存は SHA-256 ハッシュ。平文は発行時に 1 回だけ表示)
+- キーごとに、使えるモデル(エイリアス → Bedrock モデル ID)、ツール名の allow / deny、送信元 CIDR、有効期限を制限
+- キーごとの利用量制限: 予算(USD、月次 / 日次)、RPM、TPM。超過は Bedrock を呼ぶ前に 429 で返す
+- リクエストごとにモデル単価から費用を計算して DynamoDB に集計(分・日・月)。ログにも `costUsd` を出す
 - 1 リクエスト 1 行の JSON ログを CloudWatch Logs に出力(キー名、モデル、ツール名、トークン数、判定理由)
 - 利用状況の可視化: CloudWatch ダッシュボード(Terraform で作成)と、Markdown の利用レポートを出す `usage-report.py`
 
@@ -21,9 +24,11 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 | --- | --- |
 | `src/index.mjs` | ルーティング・認証・制限・ログ・Bedrock 転送 |
 | `src/openai.mjs` | OpenAI 形式(Chat Completions / Responses API)と Anthropic Messages 形式の相互変換。LiteLLM の変換を参考にした |
-| `terraform/` | Lambda、Function URL、IAM、CloudWatch Logs、利用状況ダッシュボードの定義 |
+| `terraform/` | Lambda、Function URL、IAM、DynamoDB(キーと利用量)、CloudWatch Logs、利用状況ダッシュボードの定義 |
 | `usage-report.py` | Logs Insights からキー別・モデル別の利用状況と拒否理由を集計して Markdown 出力 |
-| `keys.example.json` | API キー設定の例。コピーして `keys.json` にする(git 管理外) |
+| `src/keys.mjs` | API キーの照合(SHA-256)、利用量制限の判定、費用計算、利用量の記録(DynamoDB) |
+| `keyctl.py` | API キーの発行・一覧・更新・無効化・失効・利用量表示・モデル単価の設定・旧 JSON の取り込み |
+| `keys.example.json` | 旧形式(平文キー → 設定)の例。`keyctl.py import` で取り込める |
 | `cost-estimate.py` | 月額ランニングコストの試算スクリプト(単価と前提はファイル内に記載) |
 | `docs/` | 構成図・シーケンス図(PNG と Mermaid ソース) |
 
@@ -40,16 +45,11 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 
 ## デプロイ(Terraform)
 
-API キー設定は Terraform の state に入れたくないので、SSM パラメータだけ AWS CLI で登録します。
-
 ```bash
-cp keys.example.json keys.json   # キー・モデル・ツール・CIDR を編集
-aws ssm put-parameter --name /llm-proxy/keys --type SecureString --value file://keys.json --overwrite --region ap-northeast-1
-
 cd terraform
 terraform init
 terraform apply
-# Outputs: function_url, log_group_name, dashboard_url
+# Outputs: function_url, log_group_name, dashboard_url, keys_table_name
 ```
 
 Claude Code から使う場合は、Bedrock が受け付ける beta だけを許可リストに入れます(それ以外の `anthropic-beta` は落としてログに記録)。
@@ -66,11 +66,46 @@ terraform apply -var 'allowed_betas=context-management-2025-06-27,interleaved-th
 | --- | --- | --- |
 | `region` | `ap-northeast-1` | デプロイ先リージョン |
 | `name` | `llm-proxy` | 関数名(ロググループ・ダッシュボード名にも使う) |
-| `keys_parameter_name` | `/llm-proxy/keys` | API キー設定を置く SSM パラメータ名 |
+| `keys_table_name` | `llm-proxy-keys` | API キーと利用量を保存する DynamoDB テーブル名 |
 | `allowed_betas` | 空 | クライアントの `anthropic-beta` のうち Bedrock へ渡す値(カンマ区切り) |
 | `log_retention_days` | `30` | CloudWatch Logs の保持日数 |
 | `memory_size` / `timeout` | `256` / `300` | Lambda のメモリ(MB)とタイムアウト(秒) |
 | `create_dashboard` | `true` | 利用状況ダッシュボードを作るか |
+
+## API キーの発行と利用量制限(`keyctl.py`)
+
+管理操作は公開エンドポイントに管理 API を置かず、IAM 権限で DynamoDB を直接操作する CLI に寄せています(攻撃面を増やさないため)。aws cli の認証情報で動き、boto3 は不要です。
+
+```bash
+# モデル単価(USD / 100 万トークン、入力:出力)。費用計算と予算判定に使う
+python3 keyctl.py set-prices 'jp.anthropic.claude-haiku-4-5-20251001-v1:0=1.1:5.5,jp.anthropic.claude-sonnet-4-5-20250929-v1:0=3.3:16.5'
+
+# キーを発行(平文はこのとき 1 回だけ表示される)
+python3 keyctl.py create --name team-a \
+  --models 'claude-haiku-4-5=jp.anthropic.claude-haiku-4-5-20251001-v1:0,claude-sonnet-4-5=jp.anthropic.claude-sonnet-4-5-20250929-v1:0' \
+  --deny-tools Bash,exec_command --cidrs 203.0.113.0/24 \
+  --budget-usd 50 --budget-period monthly --rpm 60 --tpm 200000 --expires-in-days 90
+
+python3 keyctl.py list                      # 一覧(keyId、prefix、名前、制限、期限)
+python3 keyctl.py usage key_xxxxxxxxxxxx    # 期間ごとの requests / tokens / costUsd
+python3 keyctl.py update key_xxxxxxxxxxxx --budget-usd 100 --rpm 120
+python3 keyctl.py disable key_xxxxxxxxxxxx  # 一時停止(enable で戻す)
+python3 keyctl.py revoke key_xxxxxxxxxxxx   # 削除(利用量の履歴は残る)
+python3 keyctl.py import keys.json          # 旧形式の JSON(平文キー → 設定)を取り込む
+```
+
+| 制限 | 判定 | 超過時 |
+| --- | --- | --- |
+| `--budget-usd` / `--budget-period` | 期間内の累計費用 ≥ 予算 | 429 `insufficient_quota`: `budget exceeded (x/y USD monthly)` |
+| `--rpm` | 当該分のリクエスト数 ≥ RPM | 429 `rate_limit_error`: `rpm limit exceeded` |
+| `--tpm` | 当該分の入力 + 出力トークン ≥ TPM | 429 `rate_limit_error`: `tpm limit exceeded` |
+| `--expires-in-days` | 現在時刻 > 有効期限 | 403 `permission_error`: `api key expired at …` |
+| `disable` | `disabled = true` | 403 `permission_error`: `api key is disabled` |
+
+- 判定は Bedrock を呼ぶ前に、その時点までの累計で行う(ストリーミング中の分は次のリクエストから反映)。レースによる多少の超過は許容する設計。
+- キー設定は Lambda コンテナごとに 60 秒キャッシュする。失効・無効化が効くまで最大 60 秒。
+- 費用は `set-prices` で登録したモデル単価から計算する。単価未登録のモデルは費用 0 で記録し、ログに `unpriced: true` を出す。
+- DynamoDB は 1 テーブル(オンデマンド)。キー 1 件のメタデータ、期間ごとの利用量(分は TTL で自動削除)、モデル単価の 3 種類の項目を置く。
 
 ## 可視化
 
@@ -166,8 +201,7 @@ wire_api = "responses"
 ## 削除
 
 ```bash
-cd terraform && terraform destroy
-aws ssm delete-parameter --name /llm-proxy/keys --region ap-northeast-1
+cd terraform && terraform destroy   # DynamoDB テーブル(キーと利用量)も消える
 ```
 
 ## ライセンス

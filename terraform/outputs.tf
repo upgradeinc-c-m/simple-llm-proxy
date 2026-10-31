@@ -9,3 +9,7 @@ output "log_group_name" {
 output "dashboard_url" {
   value = var.create_dashboard ? "https://${var.region}.console.aws.amazon.com/cloudwatch/home?region=${var.region}#dashboards:name=${aws_cloudwatch_dashboard.usage[0].dashboard_name}" : null
 }
+
+output "keys_table_name" {
+  value = aws_dynamodb_table.keys.name
+}

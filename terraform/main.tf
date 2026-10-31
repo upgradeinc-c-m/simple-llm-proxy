@@ -14,6 +14,34 @@ resource "aws_cloudwatch_log_group" "proxy" {
   retention_in_days = var.log_retention_days
 }
 
+# ---------------------------------------------------------------- API キーと利用量(DynamoDB)
+# pk=KEY#<sha256> / sk=META がキー設定、sk=USAGE#<period> が利用量、pk=CONFIG / sk=PRICES がモデル単価。
+# オンデマンド課金。分単位の利用量は ttl 属性で自動削除。
+resource "aws_dynamodb_table" "keys" {
+  name         = var.keys_table_name
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "pk"
+  range_key    = "sk"
+
+  attribute {
+    name = "pk"
+    type = "S"
+  }
+  attribute {
+    name = "sk"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "ttl"
+    enabled        = true
+  }
+
+  point_in_time_recovery {
+    enabled = true
+  }
+}
+
 # ---------------------------------------------------------------- IAM
 data "aws_iam_policy_document" "assume" {
   statement {
@@ -41,8 +69,8 @@ data "aws_iam_policy_document" "proxy" {
   }
   statement {
     sid       = "Keys"
-    actions   = ["ssm:GetParameter"]
-    resources = ["arn:aws:ssm:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:parameter${var.keys_parameter_name}"]
+    actions   = ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:UpdateItem"]
+    resources = [aws_dynamodb_table.keys.arn]
   }
 }
 
@@ -70,7 +98,7 @@ resource "aws_lambda_function" "proxy" {
 
   environment {
     variables = {
-      KEYS_PARAM    = var.keys_parameter_name
+      KEYS_TABLE    = aws_dynamodb_table.keys.name
       ALLOWED_BETAS = var.allowed_betas
     }
   }
