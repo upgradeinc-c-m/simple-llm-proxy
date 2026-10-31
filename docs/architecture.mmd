@@ -8,17 +8,18 @@ flowchart TB
         CX["Codex CLI<br/>wire_api = responses"]
     end
     URL["Lambda Function URL<br/>AuthType NONE / InvokeMode RESPONSE_STREAM"]
-    subgraph L["プロキシ本体 Lambda(Node.js 22、依存パッケージなし、3ファイル)"]
+    subgraph L["プロキシ本体 Lambda(Node.js 22、依存パッケージなし、4ファイル)"]
         direction LR
-        R["ルーティング<br/>/v1/messages<br/>/v1/chat/completions<br/>/v1/responses<br/>/v1/models"]
-        A["認証・制限<br/>APIキー / 送信元CIDR / モデル / ツール名<br/>予算・RPM・TPM・有効期限"]
+        R["ルーティング<br/>/v1/messages<br/>/v1/chat/completions<br/>/v1/responses<br/>/v1/embeddings<br/>/v1/models など"]
+        A["認証・制限<br/>APIキー / 送信元CIDR / モデル / ツール名<br/>キーとチームの予算・RPM・TPM・有効期限"]
         T["形式変換<br/>OpenAI形式 → Anthropic形式"]
-        F["転送<br/>InvokeModel /<br/>InvokeModelWithResponseStream"]
+        F["転送(フォールバック・Guardrails)<br/>Claude: InvokeModel<br/>それ以外: Converse API"]
         R --> A --> T --> F
     end
-    DDB["DynamoDB(1テーブル)<br/>キー設定(SHA-256ハッシュ)<br/>期間別の利用量・費用 / モデル単価"]
+    DDB["DynamoDB(1テーブル)<br/>キー・チーム設定(SHA-256ハッシュ)<br/>期間別の利用量・費用 / モデル単価<br/>管理トークン / 監査ログ"]
     CW["CloudWatch Logs + ダッシュボード<br/>1リクエスト1行のJSON<br/>decision / tools / tokens / costUsd"]
-    BR["Amazon Bedrock<br/>jp.anthropic.claude-haiku-4-5 など"]
+    BR["Amazon Bedrock<br/>Claude / Nova / Llama など"]
+    SNS["SNS<br/>予算80% / 100%の通知"]
     CC -->|"Anthropic Messages"| URL
     AS -->|"Anthropic Messages"| URL
     OS -->|"Chat Completions"| URL
@@ -27,5 +28,6 @@ flowchart TB
     KC -.->|"発行 / 失効 / 制限変更 / 利用量"| DDB
     A <-.->|"照合・利用量チェック(60秒キャッシュ)"| DDB
     F -.->|"トークン数・費用を加算"| DDB
+    F -.->|"予算到達"| SNS
     F --> BR
     L -.-> CW

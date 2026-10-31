@@ -3,7 +3,7 @@
 AWS Lambda の Function URL で Anthropic Messages API 互換と OpenAI 互換(Chat Completions / Responses API)のリクエストを受け、
 Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anthropic SDK、OpenAI SDK、Codex CLI から接続先の差し替えだけで使えます。
 
-- コードはプロキシ本体 3 ファイル + 管理 UI 2 ファイル(計約 950 行)、依存パッケージなし(AWS SDK v3 は Lambda ランタイム同梱)
+- コードはプロキシ本体 4 ファイル + 管理 UI 2 ファイル(計約 1,250 行)、依存パッケージなし(AWS SDK v3 は Lambda ランタイム同梱)
 - インフラは Terraform(Lambda、Function URL、IAM、ログ、ダッシュボード)。固定費ゼロ
 - Claude 以外の Bedrock モデル(Nova、Llama、Mistral など)も同じキー・同じエンドポイントで使える(Anthropic モデルは InvokeModel に透過、それ以外は Converse API に変換)
 - API キーは `keyctl.py` か管理 UI で発行・失効・再発行(保存は SHA-256 ハッシュ。平文は発行時に 1 回だけ表示)
@@ -254,9 +254,11 @@ wire_api = "responses"
 
 - `previous_response_id`(ステートレスなので全履歴を送る)、`response_format` / `text.format` の `text` 以外、`n > 1`
 - ホスト型ツール(`web_search` など)。落として `droppedTools` としてログに記録
-- `/v1/messages/count_tokens`、埋め込みなど上記以外のエンドポイント
-- レート制限・予算上限。CIDR 判定は IPv4 のみ
-- Function URL は公開エンドポイント。WAF が必要なら CloudFront を手前に置き、Function URL を `AuthType: AWS_IAM` にする構成を検討する(未検証)
+- 画像生成・音声・バッチなど、上記エンドポイント表にないもの
+- 応答キャッシュ、ルーティングの重み付け、管理 UI の SSO 本体(`admin_auth_type = AWS_IAM` + CloudFront/Cognito の前置きで代替)
+- TPM と予算は事後計上(RPM は同期的)。並列で多少超えうる。CIDR 判定は IPv4 のみ
+- Function URL は公開エンドポイント。WAF が必要なら CloudFront を前に置き、Function URL を `AuthType: AWS_IAM` にする構成を検討する(未検証)
+- キー一覧と keyId 検索は Scan(数千件を超えるなら GSI を追加)
 
 ## 削除
 
