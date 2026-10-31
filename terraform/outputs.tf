@@ -13,3 +13,7 @@ output "dashboard_url" {
 output "keys_table_name" {
   value = aws_dynamodb_table.keys.name
 }
+
+output "admin_url" {
+  value = var.create_admin_ui ? aws_lambda_function_url.admin[0].function_url : null
+}

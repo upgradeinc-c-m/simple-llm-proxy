@@ -43,3 +43,15 @@ variable "create_dashboard" {
   type        = bool
   default     = true
 }
+
+variable "create_admin_ui" {
+  description = "管理 UI(別 Lambda + Function URL)を作るか"
+  type        = bool
+  default     = true
+}
+
+variable "admin_cidrs" {
+  description = "管理 UI にアクセスできる送信元 CIDR(カンマ区切り。空なら制限なし。管理トークンによる認証は常に必要)"
+  type        = string
+  default     = ""
+}

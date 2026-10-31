@@ -11,10 +11,13 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 - リクエストごとにモデル単価から費用を計算して DynamoDB に集計(分・日・月)。ログにも `costUsd` を出す
 - 1 リクエスト 1 行の JSON ログを CloudWatch Logs に出力(キー名、モデル、ツール名、トークン数、判定理由)
 - 利用状況の可視化: CloudWatch ダッシュボード(Terraform で作成)と、Markdown の利用レポートを出す `usage-report.py`
+- 管理 UI: キーの発行・編集・無効化・失効、キー別の今月の利用量と推定費用、モデル単価の編集。別 Lambda + Function URL が HTML と JSON API を返す(フレームワーク・ビルド・CDN なし)
 
 ![構成図](docs/architecture.png)
 
 ![利用状況ダッシュボード](docs/dashboard.png)
+
+![管理 UI](docs/admin-ui.png)
 
 設計と検証の経緯は Zenn の記事「Lambda+Bedrockで作る簡易LLMプロキシ(認証・制限・ログ)」にまとめています。
 
@@ -27,7 +30,8 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 | `terraform/` | Lambda、Function URL、IAM、DynamoDB(キーと利用量)、CloudWatch Logs、利用状況ダッシュボードの定義 |
 | `usage-report.py` | Logs Insights からキー別・モデル別の利用状況と拒否理由を集計して Markdown 出力 |
 | `src/keys.mjs` | API キーの照合(SHA-256)、利用量制限の判定、費用計算、利用量の記録(DynamoDB) |
-| `keyctl.py` | API キーの発行・一覧・更新・無効化・失効・利用量表示・モデル単価の設定・旧 JSON の取り込み |
+| `keyctl.py` | API キーの発行・一覧・更新・無効化・失効・利用量表示・モデル単価の設定・旧 JSON の取り込み・管理 UI トークンの発行 |
+| `src/admin.mjs` / `src/admin-ui.mjs` | 管理 UI(JSON API と単一ファイルの HTML)。管理トークン(SHA-256 ハッシュ保存)と任意の送信元 CIDR で保護 |
 | `keys.example.json` | 旧形式(平文キー → 設定)の例。`keyctl.py import` で取り込める |
 | `cost-estimate.py` | 月額ランニングコストの試算スクリプト(単価と前提はファイル内に記載) |
 | `docs/` | 構成図・シーケンス図(PNG と Mermaid ソース) |
@@ -71,6 +75,8 @@ terraform apply -var 'allowed_betas=context-management-2025-06-27,interleaved-th
 | `log_retention_days` | `30` | CloudWatch Logs の保持日数 |
 | `memory_size` / `timeout` | `256` / `300` | Lambda のメモリ(MB)とタイムアウト(秒) |
 | `create_dashboard` | `true` | 利用状況ダッシュボードを作るか |
+| `create_admin_ui` | `true` | 管理 UI(別 Lambda + Function URL)を作るか |
+| `admin_cidrs` | 空 | 管理 UI にアクセスできる送信元 CIDR(カンマ区切り)。トークン認証は常に必要 |
 
 ## API キーの発行と利用量制限(`keyctl.py`)
 
@@ -122,6 +128,31 @@ python3 keyctl.py import keys.json          # 旧形式の JSON(平文キー →
 - 渡されたツール名(`tools.0`〜`tools.4`、先頭 5 個の組み合わせ)
 
 アカウント内のカスタムダッシュボードは 3 枚まで無料、4 枚目以降は 1 枚 $3/月。ウィジェットの描画時に Logs Insights のスキャン課金がかかる(東京: $0.0076/GB)。
+
+### 管理 UI(`<name>-admin`)
+
+`terraform output admin_url` の URL をブラウザで開き、`keyctl.py admin-token` で発行した管理トークンを貼り付けます。トークンは sessionStorage にだけ保存され、タブを閉じると消えます。
+
+```bash
+python3 keyctl.py admin-token   # 平文はこのとき 1 回だけ表示。再実行で置き換え
+```
+
+- キー一覧: 状態(有効 / 無効 / 期限切れ)、モデル、ツール制限、CIDR、制限、今月のリクエスト数・トークン数・推定費用、予算消化率、有効期限
+- キーの発行(平文は発行直後に 1 回だけ表示)、編集、無効化 / 有効化、失効
+- キーごとの期間別利用量(日・月)
+- モデル単価の編集
+
+管理 UI の Lambda は、プロキシ本体とは別の IAM ロールで動きます(本体は GetItem / BatchGetItem / UpdateItem のみ、管理 UI は Scan / Query / PutItem / DeleteItem も持つ)。
+公開 URL なので、`admin_cidrs` でオフィスや VPN の送信元に絞ることを推奨します。より強い認証が必要なら、Function URL を `AWS_IAM` にして CloudFront + Lambda@Edge や Cognito を前に置く構成に差し替えられます。
+
+JSON API(`Authorization: Bearer <admin token>`):
+
+| メソッド | パス | 内容 |
+| --- | --- | --- |
+| GET | `/api/keys` | 一覧 + 今月の利用量 |
+| POST | `/api/keys` | 発行(応答に平文 `key`) |
+| GET / PATCH / DELETE | `/api/keys/{keyId}` | 詳細(期間別利用量)/ 更新 / 失効 |
+| GET / PUT | `/api/prices` | モデル単価 |
 
 ### 利用レポート(`usage-report.py`)
 

@@ -12,6 +12,7 @@
   keyctl.py usage <keyId> [--period month#2026-10 | day#2026-10-30]
   keyctl.py set-prices  modelId=inputPerM:outputPerM[,...]     例: jp.anthropic.claude-haiku-4-5-20251001-v1:0=1.1:5.5
   keyctl.py import keys.json        旧形式(平文キー → 設定)の JSON を取り込む(同じ平文キーのまま使える)
+  keyctl.py admin-token             管理 UI 用のトークンを発行(ハッシュを保存。平文はこの 1 回だけ表示。再実行で置き換え)
 
 共通オプション: --table llm-proxy-keys --region ap-northeast-1 --profile NAME
 """
@@ -162,6 +163,12 @@ def cmd_import(a):
         if cfg.get("cidrs"): meta["cidrs"] = cfg["cidrs"]
         put_meta(a, meta); print(f"imported {meta['keyId']} ({meta['name']})")
 
+def cmd_admin_token(a):
+    token = "llmpa_" + secrets.token_hex(24)
+    aws(["put-item", "--table-name", a.table, "--item", json.dumps({"pk": {"S": "CONFIG"}, "sk": {"S": "ADMIN"}, "tokenHash": {"S": hash_key(token)}, "updatedAt": {"N": str(int(time.time()))}})], a)
+    print("admin token set (shown once, store it securely). 管理 UI のログイン画面に貼り付ける:")
+    print(f"  {token}")
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--table", default="llm-proxy-keys"); ap.add_argument("--region"); ap.add_argument("--profile")
@@ -180,6 +187,7 @@ def main():
     p = sub.add_parser("usage"); p.add_argument("key_id"); p.add_argument("--period"); p.set_defaults(fn=cmd_usage)
     p = sub.add_parser("set-prices"); p.add_argument("prices"); p.set_defaults(fn=cmd_set_prices)
     p = sub.add_parser("import"); p.add_argument("file"); p.set_defaults(fn=cmd_import)
+    sub.add_parser("admin-token").set_defaults(fn=cmd_admin_token)
     a = ap.parse_args(); a.fn(a)
 
 if __name__ == "__main__":
