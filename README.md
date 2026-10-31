@@ -53,7 +53,7 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 cd terraform
 terraform init
 terraform apply
-# Outputs: function_url, log_group_name, dashboard_url, keys_table_name
+# Outputs: function_url, admin_url, log_group_name, dashboard_url, keys_table_name
 ```
 
 Claude Code から使う場合は、Bedrock が受け付ける beta だけを許可リストに入れます(それ以外の `anthropic-beta` は落としてログに記録)。
@@ -226,7 +226,7 @@ wire_api = "responses"
 - `previous_response_id`(ステートレスなので全履歴を送る)、`response_format` / `text.format` の `text` 以外、`n > 1`
 - ホスト型ツール(`web_search` など)。落として `droppedTools` としてログに記録
 - `/v1/messages/count_tokens`、埋め込みなど上記以外のエンドポイント
-- レート制限・予算上限。CIDR 判定は IPv4 のみ
+- CIDR 判定は IPv4 のみ
 - Function URL は公開エンドポイント。WAF が必要なら CloudFront を手前に置き、Function URL を `AuthType: AWS_IAM` にする構成を検討する(未検証)
 
 ## 削除
