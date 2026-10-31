@@ -56,6 +56,6 @@ resource "aws_lambda_function" "admin" {
 resource "aws_lambda_function_url" "admin" {
   count              = var.create_admin_ui ? 1 : 0
   function_name      = aws_lambda_function.admin[0].function_name
-  authorization_type = "NONE"
+  authorization_type = var.admin_auth_type
   invoke_mode        = "BUFFERED"
 }

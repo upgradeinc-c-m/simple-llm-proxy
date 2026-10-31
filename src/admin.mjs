@@ -27,7 +27,7 @@ async function putItem(item) { await ddb.send(new PutItemCommand({ TableName: TA
 async function listMeta() {
   const items = []; let start;
   do {
-    const r = await ddb.send(new ScanCommand({ TableName: TABLE, FilterExpression: "sk = :m", ExpressionAttributeValues: marshall({ ":m": "META" }), ExclusiveStartKey: start }));
+    const r = await ddb.send(new ScanCommand({ TableName: TABLE, FilterExpression: "sk = :m AND begins_with(pk, :k)", ExpressionAttributeValues: marshall({ ":m": "META", ":k": "KEY#" }), ExclusiveStartKey: start }));
     items.push(...(r.Items ?? []).map((i) => unmarshall(i))); start = r.LastEvaluatedKey;
   } while (start);
   return items.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
@@ -49,7 +49,7 @@ async function monthUsageFor(metas) {
   }
   return out;
 }
-const publicMeta = (m, usage) => ({ keyId: m.keyId, prefix: m.prefix, name: m.name, models: m.models ?? {}, tools: m.tools ?? null, cidrs: m.cidrs ?? [], limits: m.limits ?? {}, expiresAt: m.expiresAt ?? null, disabled: Boolean(m.disabled), createdAt: m.createdAt ?? null, updatedAt: m.updatedAt ?? null, usage: usage ?? null });
+const publicMeta = (m, usage) => ({ keyId: m.keyId, prefix: m.prefix, name: m.name, teamId: m.teamId ?? null, models: m.models ?? {}, tools: m.tools ?? null, cidrs: m.cidrs ?? [], limits: m.limits ?? {}, guardrail: m.guardrail ?? null, expiresAt: m.expiresAt ?? null, disabled: Boolean(m.disabled), createdAt: m.createdAt ?? null, updatedAt: m.updatedAt ?? null, usage: usage ?? null });
 
 // --- 入力の正規化 -----------------------------------------------------------------------------
 class BadRequest extends Error { constructor(m) { super(m); this.status = 400; } }
@@ -76,11 +76,47 @@ function normalizeKeyInput(body, base = {}) {
   if (body.expiresInDays !== undefined) { if (body.expiresInDays === null || body.expiresInDays === "") delete m.expiresAt; else m.expiresAt = now() + Number(body.expiresInDays) * 86400; }
   if (body.expiresAt !== undefined) { if (body.expiresAt === null) delete m.expiresAt; else m.expiresAt = Number(body.expiresAt); }
   if (body.disabled !== undefined) m.disabled = Boolean(body.disabled);
+  if (body.teamId !== undefined) { if (body.teamId === null || body.teamId === "") delete m.teamId; else { if (!/^team_[0-9a-f]{12}$/.test(body.teamId)) throw new BadRequest("teamId must look like team_xxxxxxxxxxxx"); m.teamId = body.teamId; } }
+  if (body.guardrail !== undefined) { if (!body.guardrail || !body.guardrail.id) delete m.guardrail; else m.guardrail = { id: String(body.guardrail.id), version: String(body.guardrail.version ?? "DRAFT") }; }
   return m;
 }
 
+// --- 監査ログ(AUDIT#<yyyy-mm> / <ts>#<rand>) -------------------------------------------------------
+async function audit(actor, action, target, body) {
+  const ts = new Date().toISOString();
+  const detail = JSON.stringify(body ?? {}).replace(/"key":"[^"]+"/g, '"key":"***"').slice(0, 1000);
+  await putItem({ pk: `AUDIT#${ts.slice(0, 7)}`, sk: `${ts}#${randomBytes(3).toString("hex")}`, actor: actor.name, role: actor.role, action, target: target ?? null, detail, ttl: now() + 400 * 86400 });
+}
+async function auditList(month) {
+  const r = await ddb.send(new QueryCommand({ TableName: TABLE, KeyConditionExpression: "pk = :p", ExpressionAttributeValues: marshall({ ":p": `AUDIT#${month}` }), ScanIndexForward: false, Limit: 200 }));
+  return (r.Items ?? []).map((i) => { const u = unmarshall(i); return { ts: u.sk.split("#")[0], actor: u.actor, role: u.role, action: u.action, target: u.target, detail: u.detail }; });
+}
+
+// --- チーム ---------------------------------------------------------------------------------------
+async function listTeams() {
+  const items = []; let start;
+  do {
+    const r = await ddb.send(new ScanCommand({ TableName: TABLE, FilterExpression: "sk = :m AND begins_with(pk, :t)", ExpressionAttributeValues: marshall({ ":m": "META", ":t": "TEAM#" }), ExclusiveStartKey: start }));
+    items.push(...(r.Items ?? []).map((i) => unmarshall(i))); start = r.LastEvaluatedKey;
+  } while (start);
+  return items.sort((a, b) => (a.createdAt ?? 0) - (b.createdAt ?? 0));
+}
+const publicTeam = (t, usage) => ({ teamId: t.teamId, name: t.name, limits: t.limits ?? {}, disabled: Boolean(t.disabled), createdAt: t.createdAt ?? null, usage: usage ?? null });
+function normalizeTeamInput(body, base = {}) {
+  const t = { ...base };
+  if (body.name !== undefined) { if (!String(body.name).trim()) throw new BadRequest("name is required"); t.name = String(body.name).trim(); }
+  if (body.limits !== undefined) {
+    const l = {}; const src = body.limits ?? {};
+    for (const k of ["budgetUsd", "rpm", "tpm"]) { if (src[k] !== undefined && src[k] !== null && src[k] !== "") { const n = Number(src[k]); if (!(n > 0)) throw new BadRequest(`${k} must be a positive number`); l[k] = n; } }
+    if (src.budgetPeriod) { if (!["monthly", "daily"].includes(src.budgetPeriod)) throw new BadRequest("budgetPeriod must be monthly or daily"); l.budgetPeriod = src.budgetPeriod; }
+    if (Object.keys(l).length) t.limits = l; else delete t.limits;
+  }
+  if (body.disabled !== undefined) t.disabled = Boolean(body.disabled);
+  return t;
+}
+
 // --- ルーティング -----------------------------------------------------------------------------
-async function api(method, path, body) {
+async function api(method, path, body, actor) {
   let mt;
   if (method === "GET" && path === "/api/keys") {
     const metas = await listMeta(); const usage = await monthUsageFor(metas);
@@ -98,6 +134,40 @@ async function api(method, path, body) {
     if (method === "GET") return { status: 200, body: { ...publicMeta(meta), usageHistory: await usageOf(meta.pk) } };
     if (method === "PATCH") { const updated = normalizeKeyInput(body, meta); updated.updatedAt = now(); await putItem(updated); return { status: 200, body: publicMeta(updated) }; }
     if (method === "DELETE") { await ddb.send(new DeleteItemCommand({ TableName: TABLE, Key: marshall({ pk: meta.pk, sk: "META" }) })); return { status: 200, body: { revoked: meta.keyId } }; }
+  }
+  if (method === "GET" && path === "/api/whoami") return { status: 200, body: actor };
+  if (method === "GET" && path === "/api/audit") return { status: 200, body: { month: body.month ?? new Date().toISOString().slice(0, 7), events: await auditList(body.month ?? new Date().toISOString().slice(0, 7)) } };
+  if ((mt = path.match(/^\/api\/audit\/(\d{4}-\d{2})$/)) && method === "GET") return { status: 200, body: { month: mt[1], events: await auditList(mt[1]) } };
+  if (method === "GET" && path === "/api/teams") {
+    const teams = await listTeams(); const usage = await monthUsageFor(teams);
+    return { status: 200, body: { teams: teams.map((t) => publicTeam(t, usage[t.pk] ?? { requests: 0, inputTokens: 0, outputTokens: 0, costUsd: 0 })) } };
+  }
+  if (method === "POST" && path === "/api/teams") {
+    const teamId = `team_${randomBytes(6).toString("hex")}`;
+    const t = normalizeTeamInput(body, { pk: `TEAM#${teamId}`, sk: "META", teamId, createdAt: now() });
+    if (!t.name) throw new BadRequest("name is required");
+    await putItem(t); return { status: 201, body: publicTeam(t) };
+  }
+  if ((mt = path.match(/^\/api\/teams\/(team_[0-9a-f]{12})$/))) {
+    const t = await getItem(`TEAM#${mt[1]}`, "META"); if (!t) return { status: 404, body: { error: "team not found" } };
+    if (method === "GET") { const keys = (await listMeta()).filter((m) => m.teamId === mt[1]).map((m) => publicMeta(m)); return { status: 200, body: { ...publicTeam(t), usageHistory: await usageOf(t.pk), keys } }; }
+    if (method === "PATCH") { const u = normalizeTeamInput(body, t); u.updatedAt = now(); await putItem(u); return { status: 200, body: publicTeam(u) }; }
+    if (method === "DELETE") {
+      const inUse = (await listMeta()).filter((m) => m.teamId === mt[1]).length;
+      if (inUse) throw new BadRequest(`team has ${inUse} key(s). detach them first`);
+      await ddb.send(new DeleteItemCommand({ TableName: TABLE, Key: marshall({ pk: t.pk, sk: "META" }) })); return { status: 200, body: { deleted: mt[1] } };
+    }
+  }
+  if ((mt = path.match(/^\/api\/keys\/(key_[0-9a-f]{12})\/regenerate$/)) && method === "POST") {
+    // 設定とキー ID を保ったまま平文を作り直す。利用量は新しい pk に引き継ぐ(当日・当月の項目をコピー)
+    const meta = await findMeta(mt[1]); if (!meta) return { status: 404, body: { error: "key not found" } };
+    const key = `llmp_${randomBytes(24).toString("hex")}`; const hash = sha256(key);
+    const next = { ...meta, pk: `KEY#${hash}`, prefix: `${key.slice(0, 12)}…`, updatedAt: now(), regeneratedFrom: meta.pk };
+    await putItem(next);
+    const usage = await ddb.send(new QueryCommand({ TableName: TABLE, KeyConditionExpression: "pk = :p AND begins_with(sk, :u)", ExpressionAttributeValues: marshall({ ":p": meta.pk, ":u": "USAGE#" }) }));
+    for (const it of usage.Items ?? []) { const u = unmarshall(it); if (u.sk.startsWith("USAGE#min#")) continue; await putItem({ ...u, pk: next.pk }); }
+    await ddb.send(new DeleteItemCommand({ TableName: TABLE, Key: marshall({ pk: meta.pk, sk: "META" }) }));
+    return { status: 200, body: { key, ...publicMeta(next) } };
   }
   if (path === "/api/prices") {
     if (method === "GET") { const p = await getItem("CONFIG", "PRICES"); return { status: 200, body: { models: p?.models ?? {}, updatedAt: p?.updatedAt ?? null } }; }
@@ -122,18 +192,28 @@ export const handler = async (event) => {
   }
   if (!path.startsWith("/api/")) return json(404, { error: "not found" });
 
-  // 管理トークンの検証(定数時間比較)
+  // 管理トークンの検証(SHA-256 で ADMIN#<hash> を引く。旧 CONFIG/ADMIN は admin ロールとして受ける)
   const token = headers["authorization"]?.replace(/^Bearer\s+/i, "") ?? "";
-  const admin = await getItem("CONFIG", "ADMIN");
-  if (!admin?.tokenHash) return json(503, { error: "admin token is not configured. run: keyctl.py admin-token" });
-  const given = Buffer.from(sha256(token)), expected = Buffer.from(admin.tokenHash);
-  if (!token || given.length !== expected.length || !timingSafeEqual(given, expected)) return json(401, { error: "invalid admin token" });
+  let actor = null;
+  if (token) {
+    const h = sha256(token);
+    const a = await getItem(`ADMIN#${h}`, "META");
+    if (a && !a.disabled) actor = { name: a.name ?? "admin", role: a.role ?? "admin" };
+    else {
+      const legacy = await getItem("CONFIG", "ADMIN");
+      if (legacy?.tokenHash) { const given = Buffer.from(h), expected = Buffer.from(legacy.tokenHash); if (given.length === expected.length && timingSafeEqual(given, expected)) actor = { name: "admin", role: "admin" }; }
+    }
+  }
+  if (!actor) return json(401, { error: "invalid admin token" });
+  if (actor.role !== "admin" && http.method !== "GET") return json(403, { error: `role "${actor.role}" is read-only` });
 
   let body = {};
   try { const raw = event.isBase64Encoded ? Buffer.from(event.body ?? "", "base64").toString() : event.body; body = raw ? JSON.parse(raw) : {}; } catch { return json(400, { error: "body must be JSON" }); }
   try {
-    const res = await api(http.method, path, body);
-    console.log(JSON.stringify({ ts: new Date().toISOString(), sourceIp, method: http.method, path, status: res.status, keyId: body?.keyId ?? (path.match(/key_[0-9a-f]{12}/) ?? [])[0] }));
+    const res = await api(http.method, path, body, actor);
+    const target = (path.match(/(key|team)_[0-9a-f]{12}/) ?? [])[0] ?? (path.startsWith("/api/prices") ? "prices" : null);
+    console.log(JSON.stringify({ ts: new Date().toISOString(), sourceIp, actor: actor.name, role: actor.role, method: http.method, path, status: res.status, target }));
+    if (http.method !== "GET" && res.status < 400) await audit(actor, `${http.method} ${path}`, target, body);
     return json(res.status, res.body);
   } catch (e) {
     if (e instanceof BadRequest) return json(400, { error: e.message });

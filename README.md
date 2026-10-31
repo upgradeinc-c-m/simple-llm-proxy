@@ -5,9 +5,15 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 
 - コードはプロキシ本体 3 ファイル + 管理 UI 2 ファイル(計約 950 行)、依存パッケージなし(AWS SDK v3 は Lambda ランタイム同梱)
 - インフラは Terraform(Lambda、Function URL、IAM、ログ、ダッシュボード)。固定費ゼロ
-- API キーは `keyctl.py` で発行・失効(保存は SHA-256 ハッシュ。平文は発行時に 1 回だけ表示)
+- Claude 以外の Bedrock モデル(Nova、Llama、Mistral など)も同じキー・同じエンドポイントで使える(Anthropic モデルは InvokeModel に透過、それ以外は Converse API に変換)
+- API キーは `keyctl.py` か管理 UI で発行・失効・再発行(保存は SHA-256 ハッシュ。平文は発行時に 1 回だけ表示)
+- チーム: キーをチームに所属させ、チーム合計の予算・RPM・TPM でも判定
 - キーごとに、使えるモデル(エイリアス → Bedrock モデル ID)、ツール名の allow / deny、送信元 CIDR、有効期限を制限
-- キーごとの利用量制限: 予算(USD、月次 / 日次)、RPM、TPM。超過は Bedrock を呼ぶ前に 429 で返す
+- キーごと・チームごとの利用量制限: 予算(USD、月次 / 日次)、RPM、TPM。超過は Bedrock を呼ぶ前に 429 で返す。RPM は DynamoDB の条件付き書き込みで同期的に数える
+- 予算アラート: 80% / 100% 到達時に SNS へ 1 回通知(メール購読は Terraform 変数)
+- モデルのフォールバック(`alias=modelA|modelB` で 429 / 5xx 時に次を試す)、Bedrock Guardrails の指定(キー単位)
+- `/v1/embeddings`(Titan / Cohere)、`/v1/messages/count_tokens`、`/v1/usage`(利用者が自分の利用量を取得)、`/health`
+- 管理トークンのロール(admin / viewer)と管理操作の監査ログ
 - リクエストごとにモデル単価から費用を計算して DynamoDB に集計(分・日・月)。ログにも `costUsd` を出す
 - 1 リクエスト 1 行の JSON ログを CloudWatch Logs に出力(キー名、モデル、ツール名、トークン数、判定理由)
 - 利用状況の可視化: CloudWatch ダッシュボード(Terraform で作成)と、Markdown の利用レポートを出す `usage-report.py`
@@ -29,7 +35,8 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 | `src/openai.mjs` | OpenAI 形式(Chat Completions / Responses API)と Anthropic Messages 形式の相互変換。LiteLLM の変換を参考にした |
 | `terraform/` | Lambda、Function URL、IAM、DynamoDB(キーと利用量)、CloudWatch Logs、利用状況ダッシュボードの定義 |
 | `usage-report.py` | Logs Insights からキー別・モデル別の利用状況と拒否理由を集計して Markdown 出力 |
-| `src/keys.mjs` | API キーの照合(SHA-256)、利用量制限の判定、費用計算、利用量の記録(DynamoDB) |
+| `src/keys.mjs` | API キー・チームの照合(SHA-256)、利用量制限の判定(RPM は条件付き書き込み)、費用計算、利用量の記録、予算アラート(SNS) |
+| `src/converse.mjs` | Anthropic Messages 形式 ↔ Bedrock Converse API の変換(Claude 以外のモデル向け) |
 | `keyctl.py` | API キーの発行・一覧・更新・無効化・失効・利用量表示・モデル単価の設定・旧 JSON の取り込み・管理 UI トークンの発行 |
 | `src/admin.mjs` / `src/admin-ui.mjs` | 管理 UI(JSON API と単一ファイルの HTML)。管理トークン(SHA-256 ハッシュ保存)と任意の送信元 CIDR で保護 |
 | `keys.example.json` | 旧形式(平文キー → 設定)の例。`keyctl.py import` で取り込める |
@@ -43,7 +50,11 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 | `POST /v1/messages` | Anthropic Messages API(ボディ透過) | Claude Code、Anthropic SDK |
 | `POST /v1/chat/completions` | OpenAI Chat Completions | OpenAI SDK、OpenAI 互換クライアント |
 | `POST /v1/responses` | OpenAI Responses API | Codex CLI、OpenAI SDK |
+| `POST /v1/embeddings` | OpenAI Embeddings(Titan / Cohere に変換) | RAG など |
+| `POST /v1/messages/count_tokens` | Anthropic のトークン数見積もり(Bedrock CountTokens) | SDK |
 | `GET /v1/models` | キーに許可されたモデル一覧 | クライアントのモデル選択 |
+| `GET /v1/usage` | 自分のキーとチームの利用量・制限(利用者向け) | 利用者の自己確認 |
+| `GET /health` | 死活確認 | 監視 |
 
 認証は `x-api-key` または `Authorization: Bearer <key>`。ツール制限はどの形式でも「モデルに渡すツール定義の名前」で判定します。
 
@@ -53,7 +64,7 @@ Amazon Bedrock に転送する簡易 LLM プロキシです。Claude Code、Anth
 cd terraform
 terraform init
 terraform apply
-# Outputs: function_url, admin_url, log_group_name, dashboard_url, keys_table_name
+# Outputs: function_url, log_group_name, dashboard_url, keys_table_name
 ```
 
 Claude Code から使う場合は、Bedrock が受け付ける beta だけを許可リストに入れます(それ以外の `anthropic-beta` は落としてログに記録)。
@@ -76,6 +87,9 @@ terraform apply -var 'allowed_betas=context-management-2025-06-27,interleaved-th
 | `memory_size` / `timeout` | `256` / `300` | Lambda のメモリ(MB)とタイムアウト(秒) |
 | `create_dashboard` | `true` | 利用状況ダッシュボードを作るか |
 | `create_admin_ui` | `true` | 管理 UI(別 Lambda + Function URL)を作るか |
+| `admin_auth_type` | `NONE` | 管理 UI の Function URL 認証。`AWS_IAM` にすると SigV4 必須(CloudFront + OAC などと併用) |
+| `create_alert_topic` / `alert_email` | `true` / 空 | 予算アラートの SNS トピックとメール購読 |
+| `log_bodies` | `false` | リクエストの messages と応答テキスト(先頭 2KB)もログに出す(監査用途) |
 | `admin_cidrs` | 空 | 管理 UI にアクセスできる送信元 CIDR(カンマ区切り)。トークン認証は常に必要 |
 
 ## API キーの発行と利用量制限(`keyctl.py`)
@@ -98,17 +112,32 @@ python3 keyctl.py update key_xxxxxxxxxxxx --budget-usd 100 --rpm 120
 python3 keyctl.py disable key_xxxxxxxxxxxx  # 一時停止(enable で戻す)
 python3 keyctl.py revoke key_xxxxxxxxxxxx   # 削除(利用量の履歴は残る)
 python3 keyctl.py import keys.json          # 旧形式の JSON(平文キー → 設定)を取り込む
+python3 keyctl.py regenerate key_xxxxxxxxxxxx  # 設定と keyId を保ったまま平文を作り直す
+
+# チーム(所属キー全体の合計で予算・RPM・TPM を判定)
+python3 keyctl.py team create --name platform --budget-usd 200 --budget-period monthly --rpm 300
+python3 keyctl.py create --name alice --team team_xxxxxxxxxxxx --models '...'
+python3 keyctl.py team usage team_xxxxxxxxxxxx
+
+# フォールバックと Guardrails
+python3 keyctl.py create --name team-b --models 'claude-sonnet-4-5=jp.anthropic.claude-sonnet-4-5-20250929-v1:0|global.anthropic.claude-sonnet-4-5-20250929-v1:0' --guardrail abcd1234efgh:1
+
+# 管理トークン(複数可、viewer は閲覧のみ)と監査ログ
+python3 keyctl.py admin-token --name alice --role admin
+python3 keyctl.py admin-token --name auditor --role viewer
+python3 keyctl.py audit --month 2026-10
 ```
 
 | 制限 | 判定 | 超過時 |
 | --- | --- | --- |
-| `--budget-usd` / `--budget-period` | 期間内の累計費用 ≥ 予算 | 429 `insufficient_quota`: `budget exceeded (x/y USD monthly)` |
-| `--rpm` | 当該分のリクエスト数 ≥ RPM | 429 `rate_limit_error`: `rpm limit exceeded` |
+| `--budget-usd` / `--budget-period` | 期間内の累計費用 ≥ 予算(キーとチームの両方) | 429 `insufficient_quota`: `budget exceeded for key (spent x of y USD monthly)` |
+| `--rpm` | 当該分の予約数が RPM に達した(条件付き書き込みで同期判定) | 429 `rate_limit_error`: `rpm limit exceeded for key (N requests per minute)` |
 | `--tpm` | 当該分の入力 + 出力トークン ≥ TPM | 429 `rate_limit_error`: `tpm limit exceeded` |
 | `--expires-in-days` | 現在時刻 > 有効期限 | 403 `permission_error`: `api key expired at …` |
 | `disable` | `disabled = true` | 403 `permission_error`: `api key is disabled` |
 
-- 判定は Bedrock を呼ぶ前に、その時点までの累計で行う(ストリーミング中の分は次のリクエストから反映)。レースによる多少の超過は許容する設計。
+- RPM は Bedrock を呼ぶ前に分の項目へ条件付きで予約を加算するため、並列でも上限を超えない。TPM と予算はその時点までの累計で判定する(ストリーミング中の分は次のリクエストから反映)。
+- 予算が 80% / 100% に達すると SNS に 1 回ずつ通知する(`alerted80` / `alerted100` フラグ)。
 - キー設定は Lambda コンテナごとに 60 秒キャッシュする。失効・無効化が効くまで最大 60 秒。
 - 費用は `set-prices` で登録したモデル単価から計算する。単価未登録のモデルは費用 0 で記録し、ログに `unpriced: true` を出す。
 - DynamoDB は 1 テーブル(オンデマンド)。キー 1 件のメタデータ、期間ごとの利用量(分は TTL で自動削除)、モデル単価の 3 種類の項目を置く。
@@ -226,7 +255,7 @@ wire_api = "responses"
 - `previous_response_id`(ステートレスなので全履歴を送る)、`response_format` / `text.format` の `text` 以外、`n > 1`
 - ホスト型ツール(`web_search` など)。落として `droppedTools` としてログに記録
 - `/v1/messages/count_tokens`、埋め込みなど上記以外のエンドポイント
-- CIDR 判定は IPv4 のみ
+- レート制限・予算上限。CIDR 判定は IPv4 のみ
 - Function URL は公開エンドポイント。WAF が必要なら CloudFront を手前に置き、Function URL を `AuthType: AWS_IAM` にする構成を検討する(未検証)
 
 ## 削除

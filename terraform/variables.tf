@@ -55,3 +55,31 @@ variable "admin_cidrs" {
   type        = string
   default     = ""
 }
+
+variable "create_alert_topic" {
+  description = "予算の 80% / 100% 到達を通知する SNS トピックを作るか"
+  type        = bool
+  default     = true
+}
+
+variable "alert_email" {
+  description = "アラートの送信先メールアドレス(空なら購読を作らない。購読確認メールが届く)"
+  type        = string
+  default     = ""
+}
+
+variable "log_bodies" {
+  description = "リクエストの messages と応答テキスト(先頭 2KB)もログに出すか。監査用途向け。既定は出さない"
+  type        = bool
+  default     = false
+}
+
+variable "admin_auth_type" {
+  description = "管理 UI の Function URL 認証。NONE(管理トークンで保護)か AWS_IAM(SigV4 必須。CloudFront + OAC などと組み合わせる)"
+  type        = string
+  default     = "NONE"
+  validation {
+    condition     = contains(["NONE", "AWS_IAM"], var.admin_auth_type)
+    error_message = "admin_auth_type は NONE か AWS_IAM"
+  }
+}

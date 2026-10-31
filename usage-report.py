@@ -13,6 +13,7 @@ QUERIES = {
     "by_key": "filter ispresent(decision) | stats count() as requests, sum(inputTokens) as inTokens, sum(outputTokens) as outTokens by keyName, decision | sort requests desc",
     "by_model": "filter decision = 'allow' and ispresent(model) | stats count() as requests, sum(inputTokens) as inTokens, sum(outputTokens) as outTokens, avg(latencyMs) as avgLatencyMs by model | sort requests desc",
     "deny_reasons": "filter ispresent(decision) and decision != 'allow' | stats count() as count by decision, reason | sort count desc | limit 20",
+    "by_team": "filter decision = 'allow' and ispresent(team) | stats count() as requests, sum(inputTokens) as inTokens, sum(outputTokens) as outTokens, sum(costUsd) as costUsd by team | sort costUsd desc",
 }
 
 def aws(args, profile=None, region=None):
@@ -56,6 +57,8 @@ def main():
     print("## キー別(判定ごと)\n"); print(table(by_key, ["keyName", "decision", "requests", "inTokens", "outTokens"]))
     by_model, st = run_query(a.log_group, QUERIES["by_model"], start, end, a.profile, a.region); scanned += num(st.get("bytesScanned"))
     print("## モデル別(許可のみ)\n"); print(table(by_model, ["model", "requests", "inTokens", "outTokens", "avgLatencyMs"]))
+    by_team, st = run_query(a.log_group, QUERIES["by_team"], start, end, a.profile, a.region); scanned += num(st.get("bytesScanned"))
+    print("## チーム別(許可のみ)\n"); print(table(by_team, ["team", "requests", "inTokens", "outTokens", "costUsd"]))
     deny, st = run_query(a.log_group, QUERIES["deny_reasons"], start, end, a.profile, a.region); scanned += num(st.get("bytesScanned"))
     print("## 拒否・エラーの理由\n"); print(table(deny, ["decision", "reason", "count"]))
     tin = sum(num(r.get("inTokens")) for r in by_model); tout = sum(num(r.get("outTokens")) for r in by_model)

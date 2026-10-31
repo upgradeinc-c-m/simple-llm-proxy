@@ -2,7 +2,7 @@
 locals {
   lg = aws_cloudwatch_log_group.proxy.name
 
-  q_base = "fields @timestamp, keyName, keyId, decision, model, stream, inputTokens, outputTokens, costUsd, latencyMs, reason | filter ispresent(decision)"
+  q_base = "fields @timestamp, keyName, keyId, team, decision, model, modelId, stream, inputTokens, outputTokens, costUsd, latencyMs, reason, fallbackTo | filter ispresent(decision)"
 
   widgets = [
     {
@@ -70,7 +70,21 @@ locals {
       }
     },
     {
-      type = "log", x = 0, y = 34, width = 24, height = 8,
+      type = "log", x = 0, y = 34, width = 12, height = 8,
+      properties = {
+        title = "チーム別の費用(USD)", region = var.region, view = "table",
+        query = "SOURCE '${local.lg}' | ${local.q_base} | filter decision = 'allow' and ispresent(team) | stats sum(costUsd) as costUsd, sum(inputTokens) as inTokens, sum(outputTokens) as outTokens, count() as requests by team | sort costUsd desc"
+      }
+    },
+    {
+      type = "log", x = 12, y = 34, width = 12, height = 8,
+      properties = {
+        title = "モデル別の件数とフォールバック", region = var.region, view = "table",
+        query = "SOURCE '${local.lg}' | ${local.q_base} | filter decision = 'allow' | stats count() as requests, sum(costUsd) as costUsd, count(fallbackTo) as fellBack by modelId | sort requests desc"
+      }
+    },
+    {
+      type = "log", x = 0, y = 42, width = 24, height = 8,
       properties = {
         title = "渡されたツール名(先頭 5 個の組み合わせ)", region = var.region, view = "table",
         query = "SOURCE '${local.lg}' | fields @timestamp, keyName, tools.0, tools.1, tools.2, tools.3, tools.4 | filter ispresent(decision) and ispresent(tools.0) | stats count() as requests by keyName, tools.0, tools.1, tools.2, tools.3, tools.4 | sort requests desc | limit 20"

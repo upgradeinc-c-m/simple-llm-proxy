@@ -61,17 +61,43 @@ data "aws_iam_policy_document" "proxy" {
   }
   statement {
     sid     = "Bedrock"
-    actions = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+    actions = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream", "bedrock:CountTokens"]
     resources = [
       "arn:aws:bedrock:*::foundation-model/*",
       "arn:aws:bedrock:*:${data.aws_caller_identity.current.account_id}:inference-profile/*",
     ]
   }
   statement {
+    sid       = "Guardrails"
+    actions   = ["bedrock:ApplyGuardrail"]
+    resources = ["arn:aws:bedrock:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:guardrail/*"]
+  }
+  statement {
     sid       = "Keys"
-    actions   = ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:UpdateItem"]
+    actions   = ["dynamodb:GetItem", "dynamodb:BatchGetItem", "dynamodb:UpdateItem", "dynamodb:Query"]
     resources = [aws_dynamodb_table.keys.arn]
   }
+  dynamic "statement" {
+    for_each = var.create_alert_topic ? [1] : []
+    content {
+      sid       = "Alerts"
+      actions   = ["sns:Publish"]
+      resources = [aws_sns_topic.alerts[0].arn]
+    }
+  }
+}
+
+# ---------------------------------------------------------------- 予算アラート(SNS)
+resource "aws_sns_topic" "alerts" {
+  count = var.create_alert_topic ? 1 : 0
+  name  = "${var.name}-alerts"
+}
+
+resource "aws_sns_topic_subscription" "alert_email" {
+  count     = var.create_alert_topic && var.alert_email != "" ? 1 : 0
+  topic_arn = aws_sns_topic.alerts[0].arn
+  protocol  = "email"
+  endpoint  = var.alert_email
 }
 
 resource "aws_iam_role" "proxy" {
@@ -98,8 +124,10 @@ resource "aws_lambda_function" "proxy" {
 
   environment {
     variables = {
-      KEYS_TABLE    = aws_dynamodb_table.keys.name
-      ALLOWED_BETAS = var.allowed_betas
+      KEYS_TABLE      = aws_dynamodb_table.keys.name
+      ALLOWED_BETAS   = var.allowed_betas
+      ALERT_TOPIC_ARN = var.create_alert_topic ? aws_sns_topic.alerts[0].arn : ""
+      LOG_BODIES      = var.log_bodies ? "true" : "false"
     }
   }
 

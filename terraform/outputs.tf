@@ -17,3 +17,7 @@ output "keys_table_name" {
 output "admin_url" {
   value = var.create_admin_ui ? aws_lambda_function_url.admin[0].function_url : null
 }
+
+output "alert_topic_arn" {
+  value = var.create_alert_topic ? aws_sns_topic.alerts[0].arn : null
+}
